@@ -1,74 +1,82 @@
-name: Run Kali NetHunter (Docker) - RDP ready
+name: RDP
 on:
   workflow_dispatch:
-
 jobs:
-  nethunter:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
     steps:
-      - name: Checkout (not really needed)
-        uses: actions/checkout@v4
-
-      - name: Pull Kali NetHunter Docker image (fast path)
+      - name: Configure Core RDP Settings
         run: |
-          echo "Pulling image izone/kalilinux:nethunter (fallback if available)..."
-          docker pull izone/kalilinux:nethunter || docker pull kalilinux/kali-rolling
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
 
-      - name: Run container (detached) and expose RDP port
+      - name: Create RDP User with Static Password
         run: |
-          # if izone image exists use it, else use kali-rolling base
-          IMG=izone/kalilinux:nethunter
-          if [[ "$(docker images -q $IMG 2> /dev/null)" == "" ]]; then
-            IMG=kalilinux/kali-rolling
-            echo "Using fallback image: $IMG"
-          else
-            echo "Using NetHunter image: $IMG"
-          fi
+          $password = "admin@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # remove old container if exists
-          docker rm -f nethunter || true
+          if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+          }
 
-          # run container detached, map host port 33890 -> container 3389 (RDP)
-          docker run -d --name nethunter --privileged -p 33890:3389 $IMG sleep infinity
+          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
 
-      - name: Install desktop + xrdp inside container
+          echo "RDP_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "TOOLBOXLAP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
         run: |
-          docker exec -u root nethunter bash -lc "apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-terminal xrdp sudo"
-          # set default session
-          docker exec -u root nethunter bash -lc "echo xfce4-session > /root/.xsession"
-          # enable and start xrdp (try various init styles)
-          docker exec -u root nethunter bash -lc "if command -v systemctl >/dev/null 2>&1; then systemctl enable --now xrdp ⠺⠟⠺⠺⠟⠞⠞⠟⠞⠺ true"
-          docker exec -u root nethunter bash -lc "service xrdp start ⠺⠺⠵⠟⠟⠵⠟⠵⠺⠞⠟⠟⠞⠺⠵⠟⠺⠵⠵⠵⠵⠵⠵⠟ true"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
 
-      - name: Create simple user in container (username: nethunter / password: changeme)
-        run: |
-          docker exec -u root nethunter bash -lc "id -u nethunter >/dev/null 2>&1 || useradd -m -s /bin/bash nethunter"
-          docker exec -u root nethunter bash -lc "echo 'nethunter:changeme' | chpasswd"
-          docker exec -u root nethunter bash -lc "adduser nethunter sudo || true"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: (Optional) Install Tailscale on runner and connect
-        if: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      - name: Establish Tailscale Connection
         run: |
-          echo "Installing Tailscale on runner (host) to expose host ports via Tailscale..."
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg | sudo apt-key add -
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt-get update -y
-          sudo apt-get install -y tailscale
-          sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --accept-routes --accept-dns=false || true
-          TSIP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$TSIP" >> $GITHUB_ENV
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Output connection info and keep job alive briefly
+      - name: Verify RDP Accessibility
         run: |
-          echo "=== READY ==="
-          if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
-            echo "If Tailscale configured, connect to: ${{ env.TAILSCALE_IP }}:33890"
-          fi
-          # print host IPs for direct connection (runner internal)
-          ip -4 addr show scope global
-          echo "Connect via RDP to <runner-host-ip>:33890  (user: nethunter / pass: changeme)"
-          # keep job alive a while so you can connect (adjust as needed)
-          sleep 600
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: TOOLBOXLAP"
+          Write-Host "Password: admin@123"
+          Write-Host "==================`n"
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
